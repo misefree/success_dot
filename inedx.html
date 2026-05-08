@@ -1,0 +1,177 @@
+-- ============================================
+-- SUCCESS DOT — Supabase 데이터베이스 스키마
+-- Supabase > SQL Editor에 전체 붙여넣기 후 실행
+-- ============================================
+
+-- 1. 공간 테이블
+CREATE TABLE IF NOT EXISTS spaces (
+  id          uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+  created_at  timestamptz DEFAULT now(),
+  user_id     uuid REFERENCES auth.users(id) ON DELETE CASCADE,
+  name        text NOT NULL,
+  type        text NOT NULL,   -- space/factory/equip/kitchen/studio
+  address     text,
+  size        text,
+  price       numeric,
+  price_type  text,            -- 월/일/시간/수익쉐어
+  deposit     numeric DEFAULT 0,
+  min_period  text,
+  max_period  text,
+  hours       text,
+  equip       text,
+  restrict    text,
+  facilities  text[],          -- 태그 배열
+  photos      text[],          -- 이미지 URL 배열
+  is_active   boolean DEFAULT true,
+  view_count  integer DEFAULT 0
+);
+
+-- 2. 신청 테이블
+CREATE TABLE IF NOT EXISTS requests (
+  id            uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+  created_at    timestamptz DEFAULT now(),
+  space_id      uuid REFERENCES spaces(id) ON DELETE SET NULL,
+  requester_id  uuid REFERENCES auth.users(id) ON DELETE CASCADE,
+  name          text NOT NULL,
+  contact       text NOT NULL,
+  interest      text,
+  start_date    date,
+  end_date      date,
+  purpose       text,
+  proposed_price numeric,
+  status        text DEFAULT 'pending',  -- pending/accepted/rejected/contracted
+  utm_source    text
+);
+
+-- 3. 계약 테이블
+CREATE TABLE IF NOT EXISTS contracts (
+  id             uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+  created_at     timestamptz DEFAULT now(),
+  request_id     uuid REFERENCES requests(id) ON DELETE SET NULL,
+  contract_no    text UNIQUE,
+  space_id       uuid REFERENCES spaces(id),
+  landlord_id    uuid REFERENCES auth.users(id),
+  tenant_id      uuid REFERENCES auth.users(id),
+  tenant_name    text,
+  space_name     text,
+  space_addr     text,
+  period_start   date,
+  period_end     date,
+  rent           numeric,
+  deposit        numeric,
+  purpose        text,
+  status         text DEFAULT 'pending',  -- pending/landlord_signed/tenant_signed/completed
+  landlord_signed_at timestamptz,
+  tenant_signed_at   timestamptz,
+  completed_at       timestamptz
+);
+
+-- 4. 후기 테이블
+CREATE TABLE IF NOT EXISTS reviews (
+  id          uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+  created_at  timestamptz DEFAULT now(),
+  space_id    uuid REFERENCES spaces(id) ON DELETE CASCADE,
+  reviewer_id uuid REFERENCES auth.users(id),
+  reviewer_name text,
+  rating      numeric CHECK (rating >= 1 AND rating <= 5),
+  content     text,
+  access_score    numeric,
+  clean_score     numeric,
+  equip_score     numeric,
+  response_score  numeric
+);
+
+-- 5. 멘토 테이블
+CREATE TABLE IF NOT EXISTS mentors (
+  id          uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+  created_at  timestamptz DEFAULT now(),
+  user_id     uuid REFERENCES auth.users(id),
+  name        text NOT NULL,
+  phone       text,
+  field       text,
+  experience  text,
+  intro       text,
+  area        text,
+  is_approved boolean DEFAULT false,
+  is_active   boolean DEFAULT true
+);
+
+-- 6. 신청자 로그 (구글시트 대체)
+CREATE TABLE IF NOT EXISTS applicant_logs (
+  id          uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+  created_at  timestamptz DEFAULT now(),
+  name        text,
+  contact     text,
+  interest    text,
+  utm_source  text,
+  type        text DEFAULT 'space'  -- space/mentor
+);
+
+-- ============================================
+-- RLS (Row Level Security) 정책
+-- ============================================
+
+ALTER TABLE spaces         ENABLE ROW LEVEL SECURITY;
+ALTER TABLE requests       ENABLE ROW LEVEL SECURITY;
+ALTER TABLE contracts      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE reviews        ENABLE ROW LEVEL SECURITY;
+ALTER TABLE mentors        ENABLE ROW LEVEL SECURITY;
+ALTER TABLE applicant_logs ENABLE ROW LEVEL SECURITY;
+
+-- 공간: 전체 공개 읽기, 본인만 쓰기
+CREATE POLICY "spaces_read_all"   ON spaces FOR SELECT USING (true);
+CREATE POLICY "spaces_insert_own" ON spaces FOR INSERT WITH CHECK (auth.uid() = user_id);
+CREATE POLICY "spaces_update_own" ON spaces FOR UPDATE USING (auth.uid() = user_id);
+CREATE POLICY "spaces_delete_own" ON spaces FOR DELETE USING (auth.uid() = user_id);
+
+-- 신청: 본인 신청 읽기, 공급자 수신 읽기
+CREATE POLICY "requests_insert" ON requests FOR INSERT WITH CHECK (auth.uid() = requester_id);
+CREATE POLICY "requests_read"   ON requests FOR SELECT USING (
+  auth.uid() = requester_id OR
+  auth.uid() IN (SELECT user_id FROM spaces WHERE id = space_id)
+);
+
+-- 계약: 당사자만 읽기/쓰기
+CREATE POLICY "contracts_read" ON contracts FOR SELECT USING (
+  auth.uid() = landlord_id OR auth.uid() = tenant_id
+);
+CREATE POLICY "contracts_insert" ON contracts FOR INSERT WITH CHECK (true);
+CREATE POLICY "contracts_update" ON contracts FOR UPDATE USING (
+  auth.uid() = landlord_id OR auth.uid() = tenant_id
+);
+
+-- 후기: 전체 읽기, 본인 쓰기
+CREATE POLICY "reviews_read_all"   ON reviews FOR SELECT USING (true);
+CREATE POLICY "reviews_insert_own" ON reviews FOR INSERT WITH CHECK (auth.uid() = reviewer_id);
+
+-- 멘토: 승인된 것만 공개, 본인 쓰기
+CREATE POLICY "mentors_read_approved" ON mentors FOR SELECT USING (is_approved = true);
+CREATE POLICY "mentors_insert"        ON mentors FOR INSERT WITH CHECK (true);
+
+-- 신청자 로그: 삽입만 허용
+CREATE POLICY "logs_insert" ON applicant_logs FOR INSERT WITH CHECK (true);
+CREATE POLICY "logs_read"   ON applicant_logs FOR SELECT USING (true);
+
+-- ============================================
+-- Storage 버킷 (사진 업로드용)
+-- ============================================
+-- Supabase > Storage > New bucket
+-- 버킷명: space-photos
+-- Public: ON (체크)
+-- 아래 SQL로 정책 추가:
+
+INSERT INTO storage.buckets (id, name, public)
+VALUES ('space-photos', 'space-photos', true)
+ON CONFLICT DO NOTHING;
+
+CREATE POLICY "space_photos_read"   ON storage.objects FOR SELECT USING (bucket_id = 'space-photos');
+CREATE POLICY "space_photos_insert" ON storage.objects FOR INSERT WITH CHECK (
+  bucket_id = 'space-photos' AND auth.uid() IS NOT NULL
+);
+CREATE POLICY "space_photos_delete" ON storage.objects FOR DELETE USING (
+  bucket_id = 'space-photos' AND auth.uid()::text = (storage.foldername(name))[1]
+);
+
+-- ============================================
+-- 완료! 이제 앱에 Supabase URL과 KEY를 입력하세요
+-- ============================================
